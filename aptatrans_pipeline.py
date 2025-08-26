@@ -12,6 +12,9 @@ from typing import Tuple
 import os
 import math
 
+### ИЗМЕНЕНИЕ 1: Импортируем autocast и GradScaler для смешанной точности (AMP) ###
+from torch.cuda.amp import autocast, GradScaler
+
 from utils import (
     tokenize_sequences, rna2vec, seq2vec, rna2vec_pretraining,
     get_dataset, get_scores, argument_seqset, API_Dataset, Masked_Dataset
@@ -93,41 +96,43 @@ class AptaTransPipeline:
 
     def _initialize_encoders(self, dim, mult_ff, n_layers, n_heads, dropout, channel_size=64, load_best_pt=False, load_best_model=False):
         """Initialize the encoder models and other components."""
-        self.encoder_aptamer = Encoders(
-            n_vocabs=self.n_apta_vocabs,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            dim=dim,
-            mult_ff=mult_ff,
-            dropout=dropout,
-            max_len=self.apta_max_len
-        ).to(self.device)
-        
-        self.token_predictor_aptamer = Token_Predictor(
-            n_vocabs=self.n_apta_vocabs,
-            n_target_vocabs=self.n_apta_target_vocabs,
-            dim=dim
-        ).to(self.device)
-        
-        self.encoder_protein = Encoders(
-            n_vocabs=self.n_prot_vocabs,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            dim=dim,
-            mult_ff=mult_ff,
-            dropout=dropout,
-            max_len=self.prot_max_len
-        ).to(self.device)
-        
-        self.token_predictor_protein = Token_Predictor(
-            n_vocabs=self.n_prot_vocabs,
-            n_target_vocabs=self.n_prot_target_vocabs,
-            dim=dim
-        ).to(self.device)
-        
-        self.to_im = To_IteractionMap().to(self.device)
-        self.conv = CONVBlocks(out_channels=channel_size).to(self.device)
-        self.predictor = Predictor(channel_size=channel_size).to(self.device)
+        # Сначала создаем экземпляры моделей
+        encoder_aptamer = Encoders(n_vocabs=self.n_apta_vocabs, n_layers=n_layers, n_heads=n_heads, dim=dim, mult_ff=mult_ff, dropout=dropout, max_len=self.apta_max_len)
+        token_predictor_aptamer = Token_Predictor(n_vocabs=self.n_apta_vocabs, n_target_vocabs=self.n_apta_target_vocabs, dim=dim)
+        encoder_protein = Encoders(n_vocabs=self.n_prot_vocabs, n_layers=n_layers, n_heads=n_heads, dim=dim, mult_ff=mult_ff, dropout=dropout, max_len=self.prot_max_len)
+        token_predictor_protein = Token_Predictor(n_vocabs=self.n_prot_vocabs, n_target_vocabs=self.n_prot_target_vocabs, dim=dim)
+        to_im = To_IteractionMap()
+        conv = CONVBlocks(out_channels=channel_size)
+        predictor = Predictor(channel_size=channel_size)
+
+        ### ИЗМЕНЕНИЕ 2: Оборачиваем модели в nn.DataParallel, если доступно несколько GPU ###
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs! Activating DataParallel.")
+            self.encoder_aptamer = nn.DataParallel(encoder_aptamer)
+            self.token_predictor_aptamer = nn.DataParallel(token_predictor_aptamer)
+            self.encoder_protein = nn.DataParallel(encoder_protein)
+            self.token_predictor_protein = nn.DataParallel(token_predictor_protein)
+            self.to_im = nn.DataParallel(to_im)
+            self.conv = nn.DataParallel(conv)
+            self.predictor = nn.DataParallel(predictor)
+        else:
+            print("Using a single GPU.")
+            self.encoder_aptamer = encoder_aptamer
+            self.token_predictor_aptamer = token_predictor_aptamer
+            self.encoder_protein = encoder_protein
+            self.token_predictor_protein = token_predictor_protein
+            self.to_im = to_im
+            self.conv = conv
+            self.predictor = predictor
+
+        # Переносим все модели на целевое устройство
+        self.encoder_aptamer.to(self.device)
+        self.token_predictor_aptamer.to(self.device)
+        self.encoder_protein.to(self.device)
+        self.token_predictor_protein.to(self.device)
+        self.to_im.to(self.device)
+        self.conv.to(self.device)
+        self.predictor.to(self.device)
 
         if load_best_pt:
             self._load_pretrained_models()
@@ -217,6 +222,8 @@ class AptaTransPipeline:
         )
         self.optimizer = torch.optim.AdamW(model_parameters, lr=lr, weight_decay=1e-5)
         self.criterion = nn.BCELoss().to(self.device)
+        ### ИЗМЕНЕНИЕ 3: Инициализируем GradScaler для основного обучения ###
+        self.scaler = GradScaler()
 
     def _set_train_mode(self):
         """Set the model to train mode."""
@@ -265,13 +272,20 @@ class AptaTransPipeline:
             if train_mode:
                 self.optimizer.zero_grad()
 
-            y_pred = self.predict(apta, prot)
             y_true = y.clone().detach().float().to(self.device)
-            loss = self.criterion(torch.flatten(y_pred), y_true)
+
+            ### ИЗМЕНЕНИЕ 4: Используем autocast для forward pass (и в train, и в eval) ###
+            with autocast():
+                y_pred = self.predict(apta, prot)
+                loss = self.criterion(torch.flatten(y_pred), y_true)
 
             if train_mode:
-                loss.backward()
-                self.optimizer.step()
+                ### ИЗМЕНЕНИЕ 5: Используем scaler для backward pass и шага оптимизатора ###
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            
+            # В режиме eval scaler не нужен, loss уже посчитан внутри autocast
 
             loss_total += loss.item()
             pred.extend(torch.flatten(y_pred).clone().detach().cpu().numpy())
@@ -315,6 +329,8 @@ class AptaTransPipeline:
         self.optimizer_pt_apta = torch.optim.AdamW(model_parameters, lr=lr, weight_decay=weight_decay)
         self.criterion_mlm_apta = nn.CrossEntropyLoss().to(self.device)
         self.criterion_ssp_apta = nn.CrossEntropyLoss().to(self.device)
+        ### ИЗМЕНЕНИЕ 6: Добавляем scaler для пре-тренировки аптамеров ###
+        self.scaler_pt_apta = GradScaler()
         best_loss = float('inf')
 
         with Timer("Total training time"):
@@ -332,7 +348,10 @@ class AptaTransPipeline:
 
                     if test_loss < best_loss:
                         best_loss = test_loss
-                        torch.save(self.encoder_aptamer.state_dict(), savepath)
+                        # Сохраняем модель, извлекая state_dict из-под DataParallel, если он есть
+                        model_to_save = self.encoder_aptamer.module if isinstance(self.encoder_aptamer, nn.DataParallel) else self.encoder_aptamer
+                        torch.save(model_to_save.state_dict(), savepath)
+
 
     def _run_epoch_pt_apta(self, loader: DataLoader, train_mode: bool) -> Tuple[float, float, float]:
         """Run a single epoch for pre-training."""
@@ -343,13 +362,15 @@ class AptaTransPipeline:
             y_masked = y_masked.long()
             y_ss = y_ss.long()
 
-            mlm_apta = self.encoder_aptamer(inputs_mlm)
-            ssp_apta = self.encoder_aptamer(inputs)
-            y_pred_mlm, y_pred_ssp = self.token_predictor_aptamer(mlm_apta, ssp_apta)
+            ### ИЗМЕНЕНИЕ 7: Применяем AMP к циклу пре-тренировки ###
+            with autocast():
+                mlm_apta = self.encoder_aptamer(inputs_mlm)
+                ssp_apta = self.encoder_aptamer(inputs)
+                y_pred_mlm, y_pred_ssp = self.token_predictor_aptamer(mlm_apta, ssp_apta)
 
-            l_mlm = self.criterion_mlm_apta(y_pred_mlm.transpose(1, 2), y_masked)
-            l_ssp = self.criterion_ssp_apta(y_pred_ssp.transpose(1, 2), y_ss)
-            loss = l_mlm * 2 + l_ssp
+                l_mlm = self.criterion_mlm_apta(y_pred_mlm.transpose(1, 2), y_masked)
+                l_ssp = self.criterion_ssp_apta(y_pred_ssp.transpose(1, 2), y_ss)
+                loss = l_mlm * 2 + l_ssp
 
             if torch.isnan(loss):
                 print(f"NaN detected in loss at batch {batch_idx} [MLM: {l_mlm.item()}][SSP: {l_ssp.item()}]")
@@ -358,8 +379,9 @@ class AptaTransPipeline:
 
             if train_mode:
                 self.optimizer_pt_apta.zero_grad()
-                loss.backward()
-                self.optimizer_pt_apta.step()
+                self.scaler_pt_apta.scale(loss).backward()
+                self.scaler_pt_apta.step(self.optimizer_pt_apta)
+                self.scaler_pt_apta.update()
 
             total_mlm += l_mlm.item()
             total_ssp += l_ssp.item()
@@ -374,6 +396,8 @@ class AptaTransPipeline:
         self.optimizer_pt_prot = torch.optim.AdamW(model_parameters, lr=lr, weight_decay=weight_decay)
         self.criterion_mlm_prot = nn.CrossEntropyLoss().to(self.device)
         self.criterion_ssp_prot = nn.CrossEntropyLoss().to(self.device)
+        ### ИЗМЕНЕНИЕ 8: Добавляем scaler для пре-тренировки протеинов ###
+        self.scaler_pt_prot = GradScaler()
         best_loss = float('inf')
 
         with Timer("Total training time"):
@@ -386,7 +410,9 @@ class AptaTransPipeline:
 
                 if test_loss < best_loss:
                     best_loss = test_loss
-                    torch.save(self.encoder_protein.state_dict(), savepath)
+                    # Сохраняем модель, извлекая state_dict из-под DataParallel, если он есть
+                    model_to_save = self.encoder_protein.module if isinstance(self.encoder_protein, nn.DataParallel) else self.encoder_protein
+                    torch.save(model_to_save.state_dict(), savepath)
 
     def _run_epoch_pt_prot(self, loader: DataLoader, train_mode: bool) -> Tuple[float, float, float]:
         """Run a single epoch for pre-training."""
@@ -397,13 +423,15 @@ class AptaTransPipeline:
             y_masked = y_masked.long()
             y_ss = y_ss.long()
 
-            mlm_prot = self.encoder_protein(inputs_mlm)
-            ssp_prot = self.encoder_protein(inputs)
-            y_pred_mlm, y_pred_ssp = self.token_predictor_protein(mlm_prot, ssp_prot)
+            ### ИЗМЕНЕНИЕ 9: Применяем AMP к циклу пре-тренировки ###
+            with autocast():
+                mlm_prot = self.encoder_protein(inputs_mlm)
+                ssp_prot = self.encoder_protein(inputs)
+                y_pred_mlm, y_pred_ssp = self.token_predictor_protein(mlm_prot, ssp_prot)
 
-            l_mlm = self.criterion_mlm_prot(y_pred_mlm.transpose(1, 2), y_masked)
-            l_ssp = self.criterion_ssp_prot(y_pred_ssp.transpose(1, 2), y_ss)
-            loss = l_mlm * 2 + l_ssp
+                l_mlm = self.criterion_mlm_prot(y_pred_mlm.transpose(1, 2), y_masked)
+                l_ssp = self.criterion_ssp_prot(y_pred_ssp.transpose(1, 2), y_ss)
+                loss = l_mlm * 2 + l_ssp
 
             if torch.isnan(loss):
                 print(f"NaN detected in loss at batch {batch_idx} [MLM: {l_mlm.item()}][SSP: {l_ssp.item()}]")
@@ -412,8 +440,9 @@ class AptaTransPipeline:
 
             if train_mode:
                 self.optimizer_pt_prot.zero_grad()
-                loss.backward()
-                self.optimizer_pt_prot.step()
+                self.scaler_pt_prot.scale(loss).backward()
+                self.scaler_pt_prot.step(self.optimizer_pt_prot)
+                self.scaler_pt_prot.update()
 
             total_mlm += l_mlm.item()
             total_ssp += l_ssp.item()
@@ -563,12 +592,20 @@ class AptaTransPipeline:
 
     def _save_best_model(self):
         """Save the best model for API."""
+        ### ИЗМЕНЕНИЕ 10: Корректное сохранение моделей, обернутых в DataParallel ###
         try:
-            torch.save(self.encoder_aptamer.state_dict(), f"./models/{self.save_name}/encoder_apta_best_auc.pt")
-            torch.save(self.encoder_protein.state_dict(), f"./models/{self.save_name}/encoder_prot_best_auc.pt")
-            torch.save(self.to_im.state_dict(), f"./models/{self.save_name}/to_im_best_auc.pt")
-            torch.save(self.conv.state_dict(), f"./models/{self.save_name}/conv_best_auc.pt")
-            torch.save(self.predictor.state_dict(), f"./models/{self.save_name}/predictor_best_auc.pt")
+            # Функция для извлечения state_dict из модели (с учетом DataParallel)
+            def get_state_dict(model):
+                if isinstance(model, nn.DataParallel):
+                    return model.module.state_dict()
+                else:
+                    return model.state_dict()
+
+            torch.save(get_state_dict(self.encoder_aptamer), f"./models/{self.save_name}/encoder_apta_best_auc.pt")
+            torch.save(get_state_dict(self.encoder_protein), f"./models/{self.save_name}/encoder_prot_best_auc.pt")
+            torch.save(get_state_dict(self.to_im), f"./models/{self.save_name}/to_im_best_auc.pt")
+            torch.save(get_state_dict(self.conv), f"./models/{self.save_name}/conv_best_auc.pt")
+            torch.save(get_state_dict(self.predictor), f"./models/{self.save_name}/predictor_best_auc.pt")
             print('Saved the best model!')
         except Exception as e:
             print(f"Error saving the best model: {e}")
